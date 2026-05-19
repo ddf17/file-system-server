@@ -9,7 +9,6 @@
 #include <errno.h>
 #include <sys/socket.h>
 #include <sys/types.h>
-#include <sys/epoll.h>
 #include <netdb.h>
 #include <dirent.h>
 #include <fcntl.h>
@@ -17,9 +16,10 @@
 #include <sys/stat.h>
 
 #include "fss/common.h"
+#include "fss/event_loop.h"
 #include "fss/format.h"
 #include "fss/vector.h"
-#include "dictionary.h"
+#include "fss/dictionary.h"
 
 #define MAX_EVENTS 64
 #define MAX_HEADER_LEN 1024
@@ -29,7 +29,7 @@ static volatile sig_atomic_t running = 1;
 static char *temp_dir = NULL;
 static vector *server_files = NULL;
 static dictionary *fd_to_client = NULL;
-static int epoll_fd = -1;
+static int event_loop_fd = -1;
 static int listen_fd = -1;
 //struct for proces need2 ??
 typedef enum {
@@ -102,7 +102,7 @@ static void cleanup_temp_directory(void) {
 static void cleanup(void) {
     cleanup_temp_directory();
     if (listen_fd != -1) close(listen_fd);
-    if (epoll_fd != -1) close(epoll_fd);
+    if (event_loop_fd != -1) close(event_loop_fd);
     if (server_files) {
         for (size_t i = 0; i < vector_size(server_files); i++) {
             free(vector_get(server_files, i));
@@ -131,8 +131,8 @@ static int make_socket_nonblocking(int fd) {
 }
 
 static int create_and_bind_socket(const char *port_str) {
-    struct addrinfo hints, *res;
-    int socket_fd;
+    struct addrinfo hints, *res, *current;
+    int socket_fd = -1;
     int reuse = 1;
 
     memset(&hints, 0, sizeof(hints));
@@ -140,47 +140,57 @@ static int create_and_bind_socket(const char *port_str) {
     hints.ai_socktype = SOCK_STREAM;
     hints.ai_flags = AI_PASSIVE;
 
-    if (getaddrinfo(NULL, port_str, &hints, &res) != 0) return -1;
-
-    socket_fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-    if (socket_fd == -1) {
-        freeaddrinfo(res);
+    int rc = getaddrinfo(NULL, port_str, &hints, &res);
+    if (rc != 0) {
+        fprintf(stderr, "getaddrinfo failed: %s\n", gai_strerror(rc));
         return -1;
     }
-    setsockopt(socket_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
-    setsockopt(socket_fd, SOL_SOCKET, SO_REUSEPORT, &reuse, sizeof(reuse));
 
-    if (bind(socket_fd, res->ai_addr, res->ai_addrlen) == -1) {
+    for (current = res; current != NULL; current = current->ai_next) {
+        socket_fd = socket(current->ai_family, current->ai_socktype, current->ai_protocol);
+        if (socket_fd == -1) {
+            continue;
+        }
+
+        setsockopt(socket_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+        setsockopt(socket_fd, SOL_SOCKET, SO_REUSEPORT, &reuse, sizeof(reuse));
+
+        if (bind(socket_fd, current->ai_addr, current->ai_addrlen) == 0) {
+            break;
+        }
+
         close(socket_fd);
-        freeaddrinfo(res);
-        return -1;
+        socket_fd = -1;
     }
 
     freeaddrinfo(res);
 
+    if (socket_fd == -1) {
+        perror("bind");
+        return -1;
+    }
+
     if (listen(socket_fd, SOMAXCONN) == -1) {
+        perror("listen");
         close(socket_fd);
         return -1;
     }
 
-    make_socket_nonblocking(socket_fd);
+    if (make_socket_nonblocking(socket_fd) == -1) {
+        perror("fcntl");
+        close(socket_fd);
+        return -1;
+    }
+
     return socket_fd;
 }
 
-static void add_fd_to_epoll(int epfd, int fd, int events) {
-    struct epoll_event event;
-    memset(&event, 0, sizeof(event));
-    event.events = events | EPOLLET;
-    event.data.fd = fd;
-    epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &event);
+static void add_fd_to_event_loop(int loop_fd, int fd, int events) {
+    event_loop_add(loop_fd, fd, events);
 }
 
-static void modify_epoll(int epfd, int fd, int events) {
-    struct epoll_event event;
-    memset(&event, 0, sizeof(event));
-    event.events = events | EPOLLET;
-    event.data.fd = fd;
-    epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &event);
+static void modify_event_loop(int loop_fd, int fd, int events) {
+    event_loop_modify(loop_fd, fd, events);
 }
 
 /* client  */
@@ -199,10 +209,10 @@ static void client_destroy(client_t *client) {
     free(client);
 }
 
-static void close_and_cleanup(int epfd, client_t *client) {
+static void close_and_cleanup(int loop_fd, client_t *client) {
     if (!client) return;
 
-    epoll_ctl(epfd, EPOLL_CTL_DEL, client->fd, NULL);
+    event_loop_remove(loop_fd, client->fd);
     close(client->fd);
 
     if (client->request_verb == PUT && client->state != STATE_DONE) {
@@ -416,7 +426,7 @@ static void send_get_size(int epfd, client_t *client) {
         client->state = STATE_SEND_GET_DATA;
         client->simple_response_len = 0;
         client->simple_response_sent = 0;
-        modify_epoll(epfd, client->fd, EPOLLOUT);
+        modify_event_loop(epfd, client->fd, FSS_EVENT_WRITE);
     }
 }
 //read from a specific offset 
@@ -527,7 +537,7 @@ static void execute_simple_response_write(int epfd, client_t *client) {
                 client->simple_response_len = 0;
                 client->simple_response_sent = 0;
                 client->state = STATE_SEND_GET_SIZE;
-                modify_epoll(epfd, client->fd, EPOLLOUT);
+                modify_event_loop(epfd, client->fd, FSS_EVENT_WRITE);
             } else {
                 client->state = STATE_DONE;
                 close_and_cleanup(epfd, client);
@@ -537,7 +547,7 @@ static void execute_simple_response_write(int epfd, client_t *client) {
             close_and_cleanup(epfd, client);
         }
     } else {
-        modify_epoll(epfd, client->fd, EPOLLOUT);
+        modify_event_loop(epfd, client->fd, FSS_EVENT_WRITE);
     }
 }
 
@@ -568,7 +578,7 @@ static void start_send_list(int epfd, client_t *client) {
     }
     client->list_sent = 0;
     client->state = STATE_SEND_LIST_DATA;
-    modify_epoll(epfd, client->fd, EPOLLOUT);
+    modify_event_loop(epfd, client->fd, FSS_EVENT_WRITE);
 }
 
 static void parse_header_and_transition(int epfd, client_t *client) {
@@ -617,14 +627,13 @@ static void parse_header_and_transition(int epfd, client_t *client) {
             strncpy(client->filename, filename, sizeof(client->filename) - 1);
             client->bytes_transferred = 0;
             client->state = STATE_RECV_PUT_SIZE;
-            modify_epoll(epfd, client->fd, EPOLLIN);
+            modify_event_loop(epfd, client->fd, FSS_EVENT_READ);
         }
     } else {
         prepare_and_send_response(epfd, client, "ERROR", err_bad_request);
     }
 }
-// EPOLLIN ....
-// reads the request header or reads file data for a PUT request
+// Reads the request header or reads file data for a PUT request.
 static void handle_read_event(int epfd, client_t *client) {
     if (client->state == STATE_RECV_HEADER) {
         while (client->header_len < MAX_HEADER_LEN - 1) {
@@ -692,7 +701,7 @@ static void accept_connections(int epfd, int listen_fd) {
         }
 
         make_socket_nonblocking(client_fd);
-        add_fd_to_epoll(epfd, client_fd, EPOLLIN);
+        add_fd_to_event_loop(epfd, client_fd, FSS_EVENT_READ);
 
         client_t *client = client_create(client_fd);
         dictionary_set(fd_to_client, &(client->fd), client);
@@ -730,42 +739,42 @@ int main(int argc, char **argv) {
         cleanup();
         return 1;
     }
-    epoll_fd = epoll_create1(0);
-    if (epoll_fd < 0) {
-        perror("epoll_create1");
+    event_loop_fd = event_loop_create();
+    if (event_loop_fd < 0) {
+        perror("event_loop_create");
         cleanup();
         return 1;
     }
-    add_fd_to_epoll(epoll_fd, listen_fd, EPOLLIN);
+    add_fd_to_event_loop(event_loop_fd, listen_fd, FSS_EVENT_READ);
 
-    struct epoll_event events[MAX_EVENTS];
+    fss_event events[MAX_EVENTS];
     while (running) {
-        int n = epoll_wait(epoll_fd, events, MAX_EVENTS, -1);
+        int n = event_loop_wait(event_loop_fd, events, MAX_EVENTS);
         if (n == -1) {
             if (errno == EINTR) continue;
-            perror("epoll_wait");
+            perror("event_loop_wait");
             break;
         }
 
         for (int i = 0; i < n; i++) {
-            int current_fd = events[i].data.fd;
+            int current_fd = events[i].fd;
 
             if (current_fd == listen_fd) {
-                accept_connections(epoll_fd, listen_fd);
+                accept_connections(event_loop_fd, listen_fd);
             } else {
                 client_t *client = dictionary_get(fd_to_client, &current_fd);
                 if (!client) continue;
 
-                if (events[i].events & (EPOLLERR | EPOLLHUP)) {
-                    close_and_cleanup(epoll_fd, client);
+                if (events[i].events & FSS_EVENT_ERROR) {
+                    close_and_cleanup(event_loop_fd, client);
                     continue;
                 }
 
-                if (events[i].events & EPOLLIN) {
-                    handle_read_event(epoll_fd, client);
+                if (events[i].events & FSS_EVENT_READ) {
+                    handle_read_event(event_loop_fd, client);
                 }
-                if ((events[i].events & EPOLLOUT) && client->state != STATE_RECV_HEADER) {
-                    handle_write_event(epoll_fd, client);
+                if ((events[i].events & FSS_EVENT_WRITE) && client->state != STATE_RECV_HEADER) {
+                    handle_write_event(event_loop_fd, client);
                 }
             }
         }

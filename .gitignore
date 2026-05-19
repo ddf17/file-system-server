@@ -8,6 +8,7 @@
 *.elf
 
 # Linker output
+bin/
 *.ilk
 *.map
 *.exp
